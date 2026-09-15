@@ -1,0 +1,34 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Market data
+data/raw/*.csv
+data/processed/*.csv
+
+# Generated reports
+reports/*.csv
+
+# Models
+models/*.pkl
+models/*.joblib
+models/*.json
+
+# Environment variables / secrets
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
