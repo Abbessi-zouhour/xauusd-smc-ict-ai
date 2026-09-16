@@ -477,6 +477,7 @@ def detect_setups(
     minimum_rr: float = 2.0,
     sl_buffer: float = 0.0,
     stop_buffer: float | None = None,
+    max_target_atr_multiple: float | None = None,
 ) -> pd.DataFrame:
     """
     Complete setup detection pipeline.
@@ -493,6 +494,11 @@ def detect_setups(
         Actual RR
           ↓
         RR >= minimum_rr
+
+    max_target_atr_multiple:
+        Optional research filter passed through to
+        targets.calculate_available_rr(). See
+        targets.find_structural_targets() for the rationale.
     """
 
     if minimum_rr <= 0:
@@ -524,6 +530,7 @@ def detect_setups(
     result = calculate_available_rr(
         result,
         minimum_rr=minimum_rr,
+        max_target_atr_multiple=max_target_atr_multiple,
     )
 
     # ---------------------------------------------------------

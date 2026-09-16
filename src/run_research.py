@@ -23,10 +23,37 @@ from pathlib import Path
 import pandas as pd
 
 from src.data_loader import load_ohlcv_csv
+from src.labels import label_setup_outcomes, summarize_outcomes
 from src.liquidity import detect_liquidity
 from src.ict import detect_ict
 from src.setups import detect_setups
 from src.structure import detect_market_structure, detect_swings
+
+
+# ---------------------------------------------------------------------
+# Minimum sample size before ML training is meaningful.
+#
+# This is a research heuristic, not a hard rule: below this many
+# labeled (non-timeout) 2R setups, an XGBoost model is very likely
+# to fit noise rather than signal. Treat pipeline output below this
+# threshold as "not yet ready for Phase 7 (ML)".
+# ---------------------------------------------------------------------
+
+MIN_SETUPS_FOR_ML = 200
+
+# ---------------------------------------------------------------------
+# Target distance cap, in multiples of ATR at the setup candle.
+#
+# Without this, the "nearest unbroken swing" target is usually close
+# (small reward), so the 2R filter ends up selecting almost only the
+# rare cases where the nearest swing happens to be implausibly far
+# away -- a tiny stop paired with a long-shot target, not a real edge.
+# Capping the target to a realistic multiple of recent volatility
+# excludes those long-shot outliers. Set to None to reproduce the
+# original unbounded behavior.
+# ---------------------------------------------------------------------
+
+MAX_TARGET_ATR_MULTIPLE = 8.0
 
 
 # ---------------------------------------------------------------------
@@ -137,6 +164,22 @@ def process_timeframe(
         sequence_window=3,
         minimum_rr=2.0,
         stop_buffer=0.0,
+        max_target_atr_multiple=MAX_TARGET_ATR_MULTIPLE,
+    )
+
+    # ---------------------------------------------------------
+    # 5b. Label outcomes for setups that pass the 2R filter
+    #
+    # A setup clearing the 2R filter only means the structural
+    # target was theoretically far enough away. This step checks
+    # what actually happened afterwards: did price reach the
+    # target before the stop, hit the stop first, or time out.
+    # ---------------------------------------------------------
+
+    df = label_setup_outcomes(
+        df,
+        max_holding_bars=200,
+        only_valid_2r=True,
     )
 
     # ---------------------------------------------------------
@@ -305,11 +348,80 @@ def process_timeframe(
         )
 
     # ---------------------------------------------------------
+    # 9b. Outcome / expectancy statistics
+    #
+    # This is the number that actually matters: of the setups
+    # that passed the 2R filter, how many resolved as wins,
+    # losses, or timeouts once price is walked forward.
+    # ---------------------------------------------------------
+
+    summary = summarize_outcomes(df)
+
+    print()
+    print("OUTCOME STATISTICS (2R-filtered setups)")
+    print("-" * 40)
+
+    print(
+        f"Labeled setups:       "
+        f"{summary['total_labeled']:,}"
+    )
+
+    print(
+        f"Wins (TP first):      "
+        f"{summary['wins']:,}"
+    )
+
+    print(
+        f"Losses (SL first):    "
+        f"{summary['losses']:,}"
+    )
+
+    print(
+        f"Timeouts:             "
+        f"{summary['timeouts']:,}"
+    )
+
+    if not pd.isna(summary["win_rate"]):
+
+        print(
+            f"Win rate:             "
+            f"{summary['win_rate'] * 100:.2f}%"
+        )
+
+        # Expectancy in R, assuming a 2R target and 1R stop.
+        # This is a lower bound: wins that ran further than the
+        # structural target aren't captured here, only whether
+        # TP was reached first.
+        expectancy_r = (
+            summary["win_rate"] * 2.0
+            - (1 - summary["win_rate"]) * 1.0
+        )
+
+        print(
+            f"Expectancy (approx):  "
+            f"{expectancy_r:+.2f}R per setup"
+        )
+
+    else:
+        print("Win rate:             n/a (no labeled setups)")
+
+    # ---------------------------------------------------------
     # 10. Output
     # ---------------------------------------------------------
 
     print()
     print(f"Saved: {output_path}")
+
+    if valid_rr_count < MIN_SETUPS_FOR_ML:
+
+        print(
+            f"WARNING: only {valid_rr_count} setups passed "
+            f"the 2R filter on {timeframe.upper()}. Below "
+            f"~{MIN_SETUPS_FOR_ML} labeled examples, an XGBoost "
+            f"model is likely to fit noise rather than signal. "
+            f"Treat this timeframe as descriptive research for "
+            f"now, not yet ready for Phase 7 (ML)."
+        )
 
     return df
 
@@ -356,6 +468,10 @@ def main() -> None:
     print("FINAL SUMMARY")
     print("=" * 70)
 
+    total_wins = 0
+    total_losses = 0
+    total_timeouts = 0
+
     for timeframe, df in all_results.items():
 
         bullish_count = int(
@@ -381,10 +497,68 @@ def main() -> None:
             df["valid_2r_setup"].sum()
         )
 
+        outcome_summary = summarize_outcomes(df)
+
+        total_wins += outcome_summary["wins"]
+        total_losses += outcome_summary["losses"]
+        total_timeouts += outcome_summary["timeouts"]
+
         print(
             f"{timeframe.upper():<5} | "
             f"setups={total:<5} | "
-            f"RR>=2={valid_2r:<5}"
+            f"RR>=2={valid_2r:<5} | "
+            f"wins={outcome_summary['wins']:<3} | "
+            f"losses={outcome_summary['losses']:<3} | "
+            f"timeouts={outcome_summary['timeouts']:<3}"
+        )
+
+    print()
+    print("-" * 70)
+
+    combined_decided = total_wins + total_losses
+    combined_total = total_wins + total_losses + total_timeouts
+
+    print(
+        f"COMBINED (all timeframes pooled): "
+        f"{combined_total} labeled setups"
+    )
+
+    if combined_decided > 0:
+
+        combined_win_rate = total_wins / combined_decided
+
+        combined_expectancy = (
+            combined_win_rate * 2.0
+            - (1 - combined_win_rate) * 1.0
+        )
+
+        print(
+            f"Combined win rate:    "
+            f"{combined_win_rate * 100:.2f}% "
+            f"({total_wins}W / {total_losses}L, "
+            f"{total_timeouts} timeouts excluded)"
+        )
+
+        print(
+            f"Combined expectancy:  "
+            f"{combined_expectancy:+.2f}R per setup"
+        )
+
+    if combined_total < MIN_SETUPS_FOR_ML:
+
+        print()
+        print(
+            f"WARNING: only {combined_total} setups total "
+            f"passed the 2R filter across ALL timeframes "
+            f"combined. This is very likely too small a "
+            f"sample for a reliable win-rate estimate, let "
+            f"alone for training an ML model. Before building "
+            f"features.py / model.py, consider either (a) "
+            f"loosening the target definition (e.g. a fallback "
+            f"ATR-multiple or liquidity-pool target when the "
+            f"nearest structural swing is unusable), or (b) "
+            f"downloading more history / more symbols to grow "
+            f"the sample."
         )
 
     print()

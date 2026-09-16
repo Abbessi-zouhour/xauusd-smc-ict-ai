@@ -72,11 +72,20 @@ def _find_previous_bullish_target(
     df: pd.DataFrame,
     position: int,
     entry: float,
+    max_distance: float | None = None,
 ) -> tuple[float, int]:
     """
     Find the nearest previous confirmed swing high above entry.
 
     Only information available BEFORE the setup candle is used.
+
+    max_distance:
+        Optional cap, in absolute price units, on how far above
+        entry the target may be. Candidates further away than
+        this are excluded, since a structurally "valid" but
+        implausibly distant target is unlikely to be reached
+        within any reasonable holding period. Pass None (default)
+        to keep the original unbounded behavior.
 
     Returns:
         (target_price, target_position)
@@ -94,13 +103,20 @@ def _find_previous_bullish_target(
     if previous_rows.empty:
         return np.nan, -1
 
-    candidates = previous_rows[
+    candidate_mask = (
         previous_rows["swing_high_price"].notna()
         & (
             previous_rows["swing_high_price"]
             > entry
         )
-    ]
+    )
+
+    if max_distance is not None:
+        candidate_mask &= (
+            previous_rows["swing_high_price"] - entry
+        ) <= max_distance
+
+    candidates = previous_rows[candidate_mask]
 
     if candidates.empty:
         return np.nan, -1
@@ -137,11 +153,18 @@ def _find_previous_bearish_target(
     df: pd.DataFrame,
     position: int,
     entry: float,
+    max_distance: float | None = None,
 ) -> tuple[float, int]:
     """
     Find the nearest previous confirmed swing low below entry.
 
     Only information available BEFORE the setup candle is used.
+
+    max_distance:
+        Optional cap, in absolute price units, on how far below
+        entry the target may be. See _find_previous_bullish_target
+        for the rationale. Pass None (default) to keep the
+        original unbounded behavior.
 
     Returns:
         (target_price, target_position)
@@ -159,13 +182,20 @@ def _find_previous_bearish_target(
     if previous_rows.empty:
         return np.nan, -1
 
-    candidates = previous_rows[
+    candidate_mask = (
         previous_rows["swing_low_price"].notna()
         & (
             previous_rows["swing_low_price"]
             < entry
         )
-    ]
+    )
+
+    if max_distance is not None:
+        candidate_mask &= (
+            entry - previous_rows["swing_low_price"]
+        ) <= max_distance
+
+    candidates = previous_rows[candidate_mask]
 
     if candidates.empty:
         return np.nan, -1
@@ -200,6 +230,7 @@ def _find_previous_bearish_target(
 
 def find_structural_targets(
     df: pd.DataFrame,
+    max_target_atr_multiple: float | None = None,
 ) -> pd.DataFrame:
     """
     Find a structural target for every detected setup.
@@ -211,6 +242,22 @@ def find_structural_targets(
         nearest previous confirmed swing low below entry.
 
     No future candles are used.
+
+    max_target_atr_multiple:
+        Optional research filter. When set, a candidate target
+        is only accepted if its distance from entry is no more
+        than (max_target_atr_multiple * atr) at the setup candle,
+        where 'atr' must already be present as a column (see
+        src.ict.detect_displacement). This excludes structurally
+        "valid" targets that are so far away, relative to recent
+        volatility, that reaching them within any realistic
+        holding period is implausible -- without this, the
+        2R filter tends to select almost exclusively these
+        long-shot targets, since nearby swings rarely clear 2R
+        on their own. When atr is missing or non-positive for a
+        given row, no cap is applied for that row (treated as
+        unknown, not as "no limit"). Pass None (default) to
+        reproduce the original unbounded behavior.
 
     Additional audit columns:
         target_index
@@ -224,6 +271,8 @@ def find_structural_targets(
     result["structural_target"] = np.nan
     result["target_index"] = -1
     result["target_age"] = np.nan
+
+    has_atr = "atr" in result.columns
 
     for position in range(len(result)):
 
@@ -240,6 +289,17 @@ def find_structural_targets(
 
         entry = float(entry)
 
+        max_distance = None
+
+        if max_target_atr_multiple is not None and has_atr:
+
+            atr_value = result.iloc[position]["atr"]
+
+            if pd.notna(atr_value) and atr_value > 0:
+                max_distance = (
+                    max_target_atr_multiple * float(atr_value)
+                )
+
         # -------------------------------------------------------------
         # Bullish setup
         # -------------------------------------------------------------
@@ -251,6 +311,7 @@ def find_structural_targets(
                     result,
                     position,
                     entry,
+                    max_distance=max_distance,
                 )
             )
 
@@ -265,6 +326,7 @@ def find_structural_targets(
                     result,
                     position,
                     entry,
+                    max_distance=max_distance,
                 )
             )
 
@@ -308,6 +370,7 @@ def find_structural_targets(
 def calculate_available_rr(
     df: pd.DataFrame,
     minimum_rr: float = 2.0,
+    max_target_atr_multiple: float | None = None,
 ) -> pd.DataFrame:
     """
     Calculate the actual reward-to-risk ratio.
@@ -322,6 +385,9 @@ def calculate_available_rr(
 
     A setup is valid when:
         available_rr >= minimum_rr
+
+    max_target_atr_multiple:
+        See find_structural_targets(). Passed through unchanged.
     """
 
     if minimum_rr <= 0:
@@ -329,7 +395,10 @@ def calculate_available_rr(
             "minimum_rr must be greater than 0."
         )
 
-    result = find_structural_targets(df)
+    result = find_structural_targets(
+        df,
+        max_target_atr_multiple=max_target_atr_multiple,
+    )
 
     result["available_reward"] = np.nan
     result["available_risk"] = np.nan
@@ -515,6 +584,7 @@ def apply_minimum_rr_filter(
 def detect_targets(
     df: pd.DataFrame,
     minimum_rr: float = 2.0,
+    max_target_atr_multiple: float | None = None,
 ) -> pd.DataFrame:
     """
     Complete structural-target pipeline.
@@ -537,4 +607,5 @@ def detect_targets(
     return calculate_available_rr(
         df,
         minimum_rr=minimum_rr,
+        max_target_atr_multiple=max_target_atr_multiple,
     )
