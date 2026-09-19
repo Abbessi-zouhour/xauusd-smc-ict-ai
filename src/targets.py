@@ -94,8 +94,16 @@ def _find_previous_bullish_target(
         (np.nan, -1)
     """
 
-    if "swing_high_price" not in df.columns:
-        return np.nan, -1
+    # "confirmed_swing_high_price" only becomes non-NaN on the row
+    # where a swing high actually became knowable (pivot + right_bars).
+    # Using the raw "swing_high_price" column here would leak
+    # information from up to right_bars candles in the future,
+    # since that column is written at the pivot row itself.
+    price_col = (
+        "confirmed_swing_high_price"
+        if "confirmed_swing_high_price" in df.columns
+        else "swing_high_price"
+    )
 
     # Only candles BEFORE the setup candle.
     previous_rows = df.iloc[:position]
@@ -104,16 +112,16 @@ def _find_previous_bullish_target(
         return np.nan, -1
 
     candidate_mask = (
-        previous_rows["swing_high_price"].notna()
+        previous_rows[price_col].notna()
         & (
-            previous_rows["swing_high_price"]
+            previous_rows[price_col]
             > entry
         )
     )
 
     if max_distance is not None:
         candidate_mask &= (
-            previous_rows["swing_high_price"] - entry
+            previous_rows[price_col] - entry
         ) <= max_distance
 
     candidates = previous_rows[candidate_mask]
@@ -123,13 +131,13 @@ def _find_previous_bullish_target(
 
     # Nearest structural level above entry.
     target_price = candidates[
-        "swing_high_price"
+        price_col
     ].min()
 
     # Find the most recent occurrence of that price.
     matching_positions = np.flatnonzero(
         (
-            previous_rows["swing_high_price"]
+            previous_rows[price_col]
             .to_numpy()
             == target_price
         )
@@ -173,8 +181,15 @@ def _find_previous_bearish_target(
         (np.nan, -1)
     """
 
-    if "swing_low_price" not in df.columns:
-        return np.nan, -1
+    # See the matching comment in _find_previous_bullish_target --
+    # this must read the confirmed-price column, not the raw
+    # pivot-row column, or it leaks up to right_bars candles of
+    # future information into the target.
+    price_col = (
+        "confirmed_swing_low_price"
+        if "confirmed_swing_low_price" in df.columns
+        else "swing_low_price"
+    )
 
     # Only candles BEFORE the setup candle.
     previous_rows = df.iloc[:position]
@@ -183,16 +198,16 @@ def _find_previous_bearish_target(
         return np.nan, -1
 
     candidate_mask = (
-        previous_rows["swing_low_price"].notna()
+        previous_rows[price_col].notna()
         & (
-            previous_rows["swing_low_price"]
+            previous_rows[price_col]
             < entry
         )
     )
 
     if max_distance is not None:
         candidate_mask &= (
-            entry - previous_rows["swing_low_price"]
+            entry - previous_rows[price_col]
         ) <= max_distance
 
     candidates = previous_rows[candidate_mask]
@@ -202,13 +217,13 @@ def _find_previous_bearish_target(
 
     # Nearest structural level below entry.
     target_price = candidates[
-        "swing_low_price"
+        price_col
     ].max()
 
     # Find the most recent occurrence of that price.
     matching_positions = np.flatnonzero(
         (
-            previous_rows["swing_low_price"]
+            previous_rows[price_col]
             .to_numpy()
             == target_price
         )
@@ -371,6 +386,7 @@ def calculate_available_rr(
     df: pd.DataFrame,
     minimum_rr: float = 2.0,
     max_target_atr_multiple: float | None = None,
+    min_risk_atr_multiple: float | None = None,
 ) -> pd.DataFrame:
     """
     Calculate the actual reward-to-risk ratio.
@@ -388,6 +404,22 @@ def calculate_available_rr(
 
     max_target_atr_multiple:
         See find_structural_targets(). Passed through unchanged.
+
+    min_risk_atr_multiple:
+        Optional research filter, symmetric to
+        max_target_atr_multiple but on the risk side. The
+        stop_loss placed by setups.calculate_setup_levels() is
+        the high/low of a single candle, which can be tiny
+        relative to normal volatility. A tiny risk denominator
+        inflates available_rr without the setup actually being
+        any more likely to reach its target -- if anything a
+        noise-sized stop is more likely to be swept immediately.
+        When set, a setup is only accepted if
+        available_risk >= min_risk_atr_multiple * atr (atr must
+        already be a column, see src.ict.detect_displacement).
+        When atr is missing or non-positive for a given row, no
+        floor is applied for that row. Pass None (default) to
+        reproduce the original unbounded behavior.
     """
 
     if minimum_rr <= 0:
@@ -496,6 +528,20 @@ def calculate_available_rr(
         result["available_risk"] > 0
     )
 
+    if min_risk_atr_multiple is not None and "atr" in result.columns:
+
+        atr = result["atr"]
+        has_atr = atr.notna() & (atr > 0)
+
+        min_risk = min_risk_atr_multiple * atr
+
+        risk_floor_ok = (
+            ~has_atr
+            | (result["available_risk"] >= min_risk)
+        )
+
+        valid_risk = valid_risk & risk_floor_ok
+
     valid_reward = (
         result["available_reward"] > 0
     )
@@ -585,6 +631,7 @@ def detect_targets(
     df: pd.DataFrame,
     minimum_rr: float = 2.0,
     max_target_atr_multiple: float | None = None,
+    min_risk_atr_multiple: float | None = None,
 ) -> pd.DataFrame:
     """
     Complete structural-target pipeline.
@@ -608,4 +655,5 @@ def detect_targets(
         df,
         minimum_rr=minimum_rr,
         max_target_atr_multiple=max_target_atr_multiple,
+        min_risk_atr_multiple=min_risk_atr_multiple,
     )

@@ -5,22 +5,36 @@ import MetaTrader5 as mt5
 import pandas as pd
 
 
+# ---------------------------------------------------------------------
+# History start dates.
+#
+# These were previously quite conservative (M15 back to 2024, H1 to
+# 2022, H4/D1 to 2018) -- that's a large part of why the RR-filtered
+# sample sizes are so small. mt5.copy_rates_range() just returns
+# whatever the broker actually has and silently gives you less if you
+# ask for more than exists, so there's no harm in requesting further
+# back than real history goes. Push these as far back as you want;
+# most brokers keep D1/H4 history for a couple decades and M15/H1 for
+# several years, but it varies by broker -- check what you actually
+# get back after running this (see the "Start:"/"End:" printout).
+# ---------------------------------------------------------------------
+
 TIMEFRAMES = {
     "m15": {
         "mt5": mt5.TIMEFRAME_M15,
-        "start": datetime(2024, 1, 1, tzinfo=timezone.utc),
+        "start": datetime(2015, 1, 1, tzinfo=timezone.utc),
     },
     "h1": {
         "mt5": mt5.TIMEFRAME_H1,
-        "start": datetime(2022, 1, 1, tzinfo=timezone.utc),
+        "start": datetime(2010, 1, 1, tzinfo=timezone.utc),
     },
     "h4": {
         "mt5": mt5.TIMEFRAME_H4,
-        "start": datetime(2018, 1, 1, tzinfo=timezone.utc),
+        "start": datetime(2000, 1, 1, tzinfo=timezone.utc),
     },
     "d1": {
         "mt5": mt5.TIMEFRAME_D1,
-        "start": datetime(2018, 1, 1, tzinfo=timezone.utc),
+        "start": datetime(2000, 1, 1, tzinfo=timezone.utc),
     },
 }
 

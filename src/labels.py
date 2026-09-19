@@ -77,6 +77,48 @@ def _validate_input(df: pd.DataFrame) -> None:
         raise ValueError("Input DataFrame is empty.")
 
 
+def _find_entry_fill(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    setup_pos: int,
+    entry: float,
+    direction: str,
+    scan_end: int,
+) -> int | None:
+    """
+    Find the first bar at or after setup_pos where price actually
+    trades at the entry level.
+
+    A "market at signal" entry (entry == close of the setup
+    candle) is always filled on the setup candle itself, since
+    entry lies within that candle's [low, high] range by
+    construction -- this reproduces the original behavior
+    exactly for setups.calculate_setup_levels(entry_mode="close").
+
+    A limit-style entry placed away from the setup candle's own
+    range (e.g. a retracement into an FVG zone, see
+    entry_mode="fvg_midpoint") is only "filled" once price
+    actually revisits that level on a later candle. If it never
+    does within scan_end, the setup was never actually
+    triggerable in real time -- returning None here means the
+    caller excludes it from outcome statistics instead of
+    silently inventing a fill that never happened.
+    """
+
+    if lows[setup_pos] <= entry <= highs[setup_pos]:
+        return setup_pos
+
+    for i in range(setup_pos + 1, scan_end + 1):
+
+        if direction == "bullish" and lows[i] <= entry:
+            return i
+
+        if direction == "bearish" and highs[i] >= entry:
+            return i
+
+    return None
+
+
 # ============================================================
 # Single-setup forward scan
 # ============================================================
@@ -85,14 +127,17 @@ def _scan_bullish_outcome(
     highs: np.ndarray,
     lows: np.ndarray,
     setup_pos: int,
+    race_start: int,
+    scan_end: int,
     entry: float,
     stop_loss: float,
     take_profit: float,
     risk: float,
-    max_holding_bars: int,
 ) -> tuple[int, int, float, float, float]:
     """
-    Walk forward from the bar AFTER the setup candle.
+    Walk forward from race_start (the bar entry was actually
+    filled on, plus one -- see _find_entry_fill) through
+    scan_end.
 
     Returns:
         (outcome, bars_held, mfe_r, mae_r, exit_price)
@@ -100,21 +145,13 @@ def _scan_bullish_outcome(
     outcome:
          1  -> take_profit reached first
         -1  -> stop_loss reached first
-         0  -> neither reached within max_holding_bars
+         0  -> neither reached within the scan window
     """
-
-    total_bars = len(highs)
-
-    scan_start = setup_pos + 1
-    scan_end = min(
-        setup_pos + max_holding_bars,
-        total_bars - 1,
-    )
 
     mfe_r = 0.0
     mae_r = 0.0
 
-    for i in range(scan_start, scan_end + 1):
+    for i in range(race_start, scan_end + 1):
 
         bar_high = highs[i]
         bar_low = lows[i]
@@ -149,28 +186,21 @@ def _scan_bearish_outcome(
     highs: np.ndarray,
     lows: np.ndarray,
     setup_pos: int,
+    race_start: int,
+    scan_end: int,
     entry: float,
     stop_loss: float,
     take_profit: float,
     risk: float,
-    max_holding_bars: int,
 ) -> tuple[int, int, float, float, float]:
     """
     Mirror of _scan_bullish_outcome() for bearish setups.
     """
 
-    total_bars = len(highs)
-
-    scan_start = setup_pos + 1
-    scan_end = min(
-        setup_pos + max_holding_bars,
-        total_bars - 1,
-    )
-
     mfe_r = 0.0
     mae_r = 0.0
 
-    for i in range(scan_start, scan_end + 1):
+    for i in range(race_start, scan_end + 1):
 
         bar_high = highs[i]
         bar_low = lows[i]
@@ -258,6 +288,8 @@ def label_setup_outcomes(
     highs = result["high"].to_numpy()
     lows = result["low"].to_numpy()
 
+    total_bars = len(highs)
+
     has_levels = (
         result["entry"].notna()
         & result["stop_loss"].notna()
@@ -293,17 +325,44 @@ def label_setup_outcomes(
         if risk <= 0:
             continue
 
+        scan_end = min(
+            pos + max_holding_bars,
+            total_bars - 1,
+        )
+
+        # Entry may not be the setup candle's own close (see
+        # setups.calculate_setup_levels(entry_mode=...)) -- find
+        # the bar where it was actually reached before assuming
+        # the trade happened at all.
+        fill_pos = _find_entry_fill(
+            highs, lows, pos, entry, direction, scan_end,
+        )
+
+        if fill_pos is None:
+            # Never filled within the scan window -- this was
+            # not a real trade. Leave unlabeled rather than
+            # inventing a fill that never happened.
+            continue
+
+        race_start = fill_pos + 1
+
+        if race_start > scan_end:
+            # Filled on the very last usable bar -- no room
+            # left to resolve the trade either way.
+            continue
+
         if direction == "bullish":
             outcome, bars_held, mfe_r, mae_r, exit_price = (
                 _scan_bullish_outcome(
                     highs,
                     lows,
                     pos,
+                    race_start,
+                    scan_end,
                     entry,
                     stop_loss,
                     take_profit,
                     risk,
-                    max_holding_bars,
                 )
             )
         else:
@@ -312,11 +371,12 @@ def label_setup_outcomes(
                     highs,
                     lows,
                     pos,
+                    race_start,
+                    scan_end,
                     entry,
                     stop_loss,
                     take_profit,
                     risk,
-                    max_holding_bars,
                 )
             )
 

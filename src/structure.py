@@ -46,6 +46,16 @@ def detect_swings(
     result["swing_high_confirmed"] = False
     result["swing_low_confirmed"] = False
 
+    # Prices as of the row where they actually became knowable
+    # (i.e. right_bars after the pivot). Anything that reads
+    # swing_high_price / swing_low_price directly at the pivot
+    # row is implicitly assuming the swing was already known
+    # before it was confirmed -- that is look-ahead bias.
+    # Downstream code that needs a causally-safe target should
+    # read these two columns instead.
+    result["confirmed_swing_high_price"] = float("nan")
+    result["confirmed_swing_low_price"] = float("nan")
+
     highs = result["high"].to_numpy()
     lows = result["low"].to_numpy()
 
@@ -109,6 +119,11 @@ def detect_swings(
                 "swing_high_confirmed"
             ] = True
 
+            result.at[
+                confirmation_timestamp,
+                "confirmed_swing_high_price"
+            ] = highs[pivot]
+
         if is_swing_low:
 
             result.at[
@@ -125,6 +140,11 @@ def detect_swings(
                 confirmation_timestamp,
                 "swing_low_confirmed"
             ] = True
+
+            result.at[
+                confirmation_timestamp,
+                "confirmed_swing_low_price"
+            ] = lows[pivot]
 
     return result
 

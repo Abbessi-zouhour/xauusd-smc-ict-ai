@@ -119,7 +119,7 @@ def _find_sequence(
     displacement: pd.Series,
     fvg: pd.Series,
     window: int,
-) -> pd.Series:
+) -> tuple[pd.Series, pd.Series]:
     """
     Detect:
 
@@ -128,6 +128,21 @@ def _find_sequence(
     within a maximum total sequence window.
 
     The setup is marked on the FVG candle.
+
+    Returns:
+        (setup_mask, sequence_start)
+
+        setup_mask:
+            Boolean series, True on the FVG candle that
+            completes a sweep -> displacement -> FVG sequence.
+
+        sequence_start:
+            Integer position of the sweep candle that started
+            the sequence, recorded on the same FVG row as
+            setup_mask. -1 where there is no setup. This is
+            what actually invalidates the setup thesis (the
+            sweep's extreme), which can be earlier than -- and
+            further away than -- the confirmation candle itself.
     """
 
     if window < 2:
@@ -139,6 +154,12 @@ def _find_sequence(
         False,
         index=sweep.index,
         dtype=bool,
+    )
+
+    sequence_start = pd.Series(
+        -1,
+        index=sweep.index,
+        dtype="int64",
     )
 
     sweep_values = (
@@ -215,8 +236,9 @@ def _find_sequence(
 
         # Setup is marked on the FVG candle
         result.iloc[first_fvg_pos] = True
+        sequence_start.iloc[first_fvg_pos] = sweep_pos
 
-    return result
+    return result, sequence_start
 
 
 def detect_setup_context(
@@ -247,6 +269,8 @@ def detect_setup_context(
             dtype="object",
         )
 
+        result["setup_sequence_start"] = -1
+
         return result
 
     result = _ensure_ict_columns(df)
@@ -260,7 +284,7 @@ def detect_setup_context(
     #       ↓
     # FVG
     # ---------------------------------------------------------
-    result["bullish_setup"] = _find_sequence(
+    result["bullish_setup"], bullish_start = _find_sequence(
         result["bullish_liquidity_sweep"],
         result["bullish_displacement"],
         result["bullish_fvg"],
@@ -276,12 +300,30 @@ def detect_setup_context(
     #       ↓
     # FVG
     # ---------------------------------------------------------
-    result["bearish_setup"] = _find_sequence(
+    result["bearish_setup"], bearish_start = _find_sequence(
         result["bearish_liquidity_sweep"],
         result["bearish_displacement"],
         result["bearish_fvg"],
         sequence_window,
     )
+
+    # ---------------------------------------------------------
+    # Sequence start (position of the sweep candle that began
+    # the matched sequence). Used to compute the real
+    # invalidation extreme in calculate_setup_levels(), rather
+    # than only looking at the confirmation candle.
+    # ---------------------------------------------------------
+    result["setup_sequence_start"] = -1
+
+    result.loc[
+        result["bullish_setup"],
+        "setup_sequence_start",
+    ] = bullish_start[result["bullish_setup"]]
+
+    result.loc[
+        result["bearish_setup"],
+        "setup_sequence_start",
+    ] = bearish_start[result["bearish_setup"]]
 
     # ---------------------------------------------------------
     # Setup direction
@@ -310,18 +352,57 @@ def calculate_setup_levels(
     reward_multiple: float | None = None,
     sl_buffer: float = 0.0,
     stop_buffer: float | None = None,
+    entry_mode: str = "close",
+    fvg_retracement: float = 0.5,
 ) -> pd.DataFrame:
     """
     Calculate entry and structural stop-loss.
 
     Entry:
-        Close of the setup candle.
+        entry_mode="close" (default, original behavior):
+            Close of the setup (FVG confirmation) candle.
+            This is a "chase" entry -- by the time it fills,
+            the sweep + displacement + FVG sequence has already
+            happened, so it's far from the sweep's extreme.
+            Combined with the honest stop below (the sweep's
+            actual invalidation point), that produces a large,
+            realistic risk with little room for a nearby target
+            to give a good RR.
+
+        entry_mode="fvg_midpoint":
+            A retracement entry inside the FVG zone itself,
+            at fvg_retracement of the way from fvg_top toward
+            fvg_bottom (0.5 = the zone's midpoint, the common
+            ICT "optimal trade entry" convention). This is a
+            limit-style entry: it assumes price pulls back into
+            the imbalance before continuing, which is much
+            closer to the sweep's extreme than the confirmation
+            candle's close, without weakening the stop.
+            Requires "fvg_top" and "fvg_bottom" columns (see
+            src.ict.detect_fvg). Rows where a setup exists but
+            these columns are missing/NaN fall back to the
+            "close" entry for that row.
+
+            IMPORTANT: an entry away from the setup candle's own
+            close is not guaranteed to ever be filled. Use
+            label_setup_outcomes() (labels.py) to label
+            outcomes -- it already scans forward for the first
+            bar where price actually reaches this entry level,
+            and excludes setups that never got filled rather
+            than assuming a fill that never happened.
 
     Bullish stop:
-        Low of the setup candle.
+        The lowest low reached between the liquidity-sweep
+        candle and the confirmation (FVG) candle, inclusive --
+        i.e. the real invalidation point of the setup thesis.
+        Falls back to the low of the setup candle alone when
+        the sweep's position is unknown (setup_sequence_start
+        missing/-1), preserving the old behavior for callers
+        that construct setup_direction manually.
 
     Bearish stop:
-        High of the setup candle.
+        Mirror of the bullish case: the highest high reached
+        between the sweep candle and the confirmation candle.
 
     IMPORTANT:
         reward_multiple is retained only for backward
@@ -338,6 +419,16 @@ def calculate_setup_levels(
     stop_buffer:
         Preferred parameter name.
     """
+
+    if entry_mode not in ("close", "fvg_midpoint"):
+        raise ValueError(
+            'entry_mode must be "close" or "fvg_midpoint".'
+        )
+
+    if not (0.0 <= fvg_retracement <= 1.0):
+        raise ValueError(
+            "fvg_retracement must be between 0 and 1."
+        )
 
     # ---------------------------------------------------------
     # Backward-compatible validation
@@ -403,30 +494,106 @@ def calculate_setup_levels(
         "close",
     ]
 
+    if entry_mode == "fvg_midpoint":
+
+        has_zone = (
+            "fvg_top" in result.columns
+            and "fvg_bottom" in result.columns
+        )
+
+        if has_zone:
+
+            zone_ok = (
+                result["fvg_top"].notna()
+                & result["fvg_bottom"].notna()
+            )
+
+            # Bullish: retrace DOWN from fvg_top toward
+            # fvg_bottom by fvg_retracement.
+            bullish_retrace = bullish & zone_ok
+
+            result.loc[
+                bullish_retrace,
+                "entry",
+            ] = (
+                result.loc[bullish_retrace, "fvg_top"]
+                - fvg_retracement
+                * (
+                    result.loc[bullish_retrace, "fvg_top"]
+                    - result.loc[bullish_retrace, "fvg_bottom"]
+                )
+            )
+
+            # Bearish: retrace UP from fvg_bottom toward
+            # fvg_top by fvg_retracement.
+            bearish_retrace = bearish & zone_ok
+
+            result.loc[
+                bearish_retrace,
+                "entry",
+            ] = (
+                result.loc[bearish_retrace, "fvg_bottom"]
+                + fvg_retracement
+                * (
+                    result.loc[bearish_retrace, "fvg_top"]
+                    - result.loc[bearish_retrace, "fvg_bottom"]
+                )
+            )
+
+            # Rows without a usable FVG zone keep the "close"
+            # entry already assigned above.
+
     # ---------------------------------------------------------
     # Structural Stop Loss
+    #
+    # Uses the extreme reached between the sweep candle and the
+    # confirmation candle, not just the confirmation candle's
+    # own wick -- that extreme is the actual point that
+    # invalidates the setup thesis. A stop placed only on the
+    # confirmation candle can be far tighter than that real
+    # invalidation point, which artificially inflates RR and
+    # gets setups stopped out by ordinary noise.
     # ---------------------------------------------------------
-    result.loc[
-        bullish,
-        "stop_loss",
-    ] = (
-        result.loc[
-            bullish,
-            "low",
-        ]
-        - sl_buffer
+    has_sequence_start = (
+        "setup_sequence_start" in result.columns
     )
 
-    result.loc[
-        bearish,
-        "stop_loss",
-    ] = (
-        result.loc[
-            bearish,
-            "high",
-        ]
-        + sl_buffer
-    )
+    highs = result["high"].to_numpy()
+    lows = result["low"].to_numpy()
+
+    stop_loss_col = result.columns.get_loc("stop_loss")
+    direction_col = result.columns.get_loc("setup_direction")
+
+    if has_sequence_start:
+        start_col = result.columns.get_loc(
+            "setup_sequence_start"
+        )
+
+    for pos in range(len(result)):
+
+        direction = result.iat[pos, direction_col]
+
+        if direction not in ("bullish", "bearish"):
+            continue
+
+        start_pos = pos
+
+        if has_sequence_start:
+            start_value = result.iat[pos, start_col]
+
+            if (
+                pd.notna(start_value)
+                and int(start_value) >= 0
+                and int(start_value) <= pos
+            ):
+                start_pos = int(start_value)
+
+        if direction == "bullish":
+            stop = lows[start_pos : pos + 1].min() - sl_buffer
+        else:
+            stop = highs[start_pos : pos + 1].max() + sl_buffer
+
+        result.iat[pos, stop_loss_col] = stop
 
     # ---------------------------------------------------------
     # Risk
@@ -478,6 +645,9 @@ def detect_setups(
     sl_buffer: float = 0.0,
     stop_buffer: float | None = None,
     max_target_atr_multiple: float | None = None,
+    min_risk_atr_multiple: float | None = None,
+    entry_mode: str = "close",
+    fvg_retracement: float = 0.5,
 ) -> pd.DataFrame:
     """
     Complete setup detection pipeline.
@@ -499,6 +669,21 @@ def detect_setups(
         Optional research filter passed through to
         targets.calculate_available_rr(). See
         targets.find_structural_targets() for the rationale.
+
+    min_risk_atr_multiple:
+        Optional research filter passed through to
+        targets.calculate_available_rr(). Rejects setups whose
+        stop_loss (the high/low of a single candle) is smaller
+        than min_risk_atr_multiple * atr, since a noise-sized
+        stop inflates available_rr without making the setup any
+        more likely to actually reach its target. See
+        targets.calculate_available_rr() for the rationale.
+
+    entry_mode / fvg_retracement:
+        Passed through to calculate_setup_levels(). See that
+        function's docstring -- "fvg_midpoint" requires
+        label_setup_outcomes() to check for an actual fill
+        before a setup counts as a trade.
     """
 
     if minimum_rr <= 0:
@@ -522,6 +707,8 @@ def detect_setups(
         reward_multiple=reward_multiple,
         sl_buffer=sl_buffer,
         stop_buffer=stop_buffer,
+        entry_mode=entry_mode,
+        fvg_retracement=fvg_retracement,
     )
 
     # ---------------------------------------------------------
@@ -531,6 +718,7 @@ def detect_setups(
         result,
         minimum_rr=minimum_rr,
         max_target_atr_multiple=max_target_atr_multiple,
+        min_risk_atr_multiple=min_risk_atr_multiple,
     )
 
     # ---------------------------------------------------------

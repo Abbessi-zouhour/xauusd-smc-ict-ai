@@ -303,3 +303,53 @@ def test_negative_sl_buffer():
             df,
             sl_buffer=-1,
         )
+
+
+def test_stop_uses_sweep_extreme_not_confirmation_candle():
+    """
+    Regression test for a bug where the structural stop was
+    placed at the low/high of the confirmation (FVG) candle
+    instead of the real invalidation point: the extreme reached
+    between the liquidity-sweep candle and the confirmation
+    candle. A stop placed on the confirmation candle alone can
+    be far tighter than the level that actually invalidates the
+    setup thesis, artificially inflating RR and causing setups
+    to be stopped out by ordinary noise.
+    """
+
+    df = pd.DataFrame(
+        {
+            "open":  [110, 95, 101, 102.0, 103.00],
+            "high":  [111, 96, 102, 103.0, 103.05],
+            # Sweep candle (index 0) reaches down to 90 --
+            # that's the real invalidation point.
+            "low":   [90, 94, 100, 101.9, 102.98],
+            "close": [95, 95.5, 101.5, 102.9, 103.02],
+            "bullish_liquidity_sweep": [
+                True, False, False, False, False,
+            ],
+            "bearish_liquidity_sweep": [False] * 5,
+            "previous_high": [np.nan] * 5,
+            "previous_low": [np.nan] * 5,
+            "bullish_displacement": [
+                False, True, False, False, False,
+            ],
+            "bearish_displacement": [False] * 5,
+            "bullish_fvg": [
+                False, False, False, True, False,
+            ],
+            "bearish_fvg": [False] * 5,
+        }
+    )
+
+    ctx = detect_setup_context(df, sequence_window=3)
+    result = calculate_setup_levels(ctx)
+
+    row = result.loc[3]
+
+    assert row["setup_direction"] == "bullish"
+
+    # Stop must be the sweep candle's low (90), not the
+    # confirmation candle's low (101.9).
+    assert row["stop_loss"] == 90.0
+    assert row["risk"] == pytest.approx(12.9)

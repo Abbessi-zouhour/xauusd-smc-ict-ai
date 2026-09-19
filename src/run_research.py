@@ -55,6 +55,21 @@ MIN_SETUPS_FOR_ML = 200
 
 MAX_TARGET_ATR_MULTIPLE = 8.0
 
+# ---------------------------------------------------------------------
+# Minimum risk floor, in multiples of ATR at the setup candle.
+#
+# stop_loss is the high/low of a single candle (calculate_setup_levels).
+# When that candle's range is tiny relative to normal volatility, RR
+# gets inflated by a noise-sized denominator rather than a genuinely
+# favorable setup -- and a noise-sized stop is *more* likely to be hit
+# by ordinary price action, not less. This floor rejects setups whose
+# risk is too small to be a meaningful stop. Set to None to reproduce
+# the original unbounded behavior (not recommended -- see README notes
+# on this fix).
+# ---------------------------------------------------------------------
+
+MIN_RISK_ATR_MULTIPLE = 0.5
+
 
 # ---------------------------------------------------------------------
 # Project paths
@@ -165,6 +180,9 @@ def process_timeframe(
         minimum_rr=2.0,
         stop_buffer=0.0,
         max_target_atr_multiple=MAX_TARGET_ATR_MULTIPLE,
+        min_risk_atr_multiple=MIN_RISK_ATR_MULTIPLE,
+        entry_mode="fvg_midpoint",
+        fvg_retracement=0.5,
     )
 
     # ---------------------------------------------------------
