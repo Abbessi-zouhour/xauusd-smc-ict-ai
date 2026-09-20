@@ -1,5 +1,5 @@
 """
-Run the XAUUSD SMC / ICT research pipeline.
+Run the SMC / ICT research pipeline for each symbol in SYMBOLS.
 
 This script:
 1. Loads historical OHLCV data.
@@ -70,6 +70,29 @@ MAX_TARGET_ATR_MULTIPLE = 8.0
 
 MIN_RISK_ATR_MULTIPLE = 0.5
 
+# ---------------------------------------------------------------------
+# Round-trip spread cost, in price units, PER SYMBOL.
+#
+# This pipeline only has OHLC, not a historical bid/ask series, so
+# this is a fixed approximation rather than something that varies
+# with volatility over the dataset's history. Spread must be
+# per-symbol: a fixed dollar amount is meaningful for one instrument's
+# price scale and wildly wrong for another (0.30 as a XAUUSD spread,
+# ~4378, is ~0.007% of price; the same 0.30 applied to XAGUSD, ~60-95,
+# would be 0.3-0.5% of price -- an order of magnitude too large,
+# and it visibly wiped out almost every XAGUSD setup's reward when
+# first tried). Check each symbol's own live bid/ask in MT5 Market
+# Watch and set its value here -- xagusd's 0.03 below is a rough
+# placeholder, NOT verified against a live quote the way xauusd's
+# 0.30 was; correct it once you've checked. Set a symbol's spread to
+# 0.0 to reproduce the original no-cost behavior for it.
+# ---------------------------------------------------------------------
+
+SPREAD = {
+    "xauusd": 0.30,
+    "xagusd": 0.03,
+}
+
 
 # ---------------------------------------------------------------------
 # Project paths
@@ -85,12 +108,28 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 # Timeframes
 # ---------------------------------------------------------------------
 
-TIMEFRAMES = {
-    "m15": "xauusd_m15.csv",
-    "h1": "xauusd_h1.csv",
-    "h4": "xauusd_h4.csv",
-    "d1": "xauusd_d1.csv",
-}
+# ---------------------------------------------------------------------
+# Symbols and timeframes
+#
+# Each symbol is processed completely separately -- its own section,
+# its own FINAL SUMMARY, its own output CSVs. They are NEVER pooled
+# together: XAUUSD and XAGUSD are different markets, and averaging
+# their setups into one number would blur two different things into
+# something meaningless. Add more symbols here once you've pulled
+# their raw data with src.mt5_data (SYMBOLS there must match these
+# keys).
+# ---------------------------------------------------------------------
+
+SYMBOLS = ["xauusd", "xagusd"]
+
+TIMEFRAME_NAMES = ["m15", "h1", "h4", "d1"]
+
+
+def _raw_filenames(symbol: str) -> dict[str, str]:
+    return {
+        tf: f"{symbol}_{tf}.csv"
+        for tf in TIMEFRAME_NAMES
+    }
 
 
 # ---------------------------------------------------------------------
@@ -98,14 +137,15 @@ TIMEFRAMES = {
 # ---------------------------------------------------------------------
 
 def process_timeframe(
+    symbol: str,
     timeframe: str,
     filename: str,
 ) -> pd.DataFrame:
-    """Process one timeframe through the complete research pipeline."""
+    """Process one symbol/timeframe through the complete research pipeline."""
 
     print()
     print("=" * 70)
-    print(f"Processing {timeframe.upper()}")
+    print(f"Processing {symbol.upper()} {timeframe.upper()}")
     print("=" * 70)
 
     input_path = RAW_DIR / filename
@@ -174,6 +214,17 @@ def process_timeframe(
     # 5. SMC / ICT setups
     # ---------------------------------------------------------
 
+    symbol_spread = SPREAD.get(symbol)
+
+    if symbol_spread is None:
+        print(
+            f"WARNING: no SPREAD entry for {symbol!r} -- "
+            "defaulting to 0.0 (no cost modeled). Add this "
+            "symbol to the SPREAD dict once you've checked its "
+            "live bid/ask in MT5."
+        )
+        symbol_spread = 0.0
+
     df = detect_setups(
         df,
         sequence_window=3,
@@ -183,6 +234,7 @@ def process_timeframe(
         min_risk_atr_multiple=MIN_RISK_ATR_MULTIPLE,
         entry_mode="fvg_midpoint",
         fvg_retracement=0.5,
+        spread=symbol_spread,
     )
 
     # ---------------------------------------------------------
@@ -211,10 +263,20 @@ def process_timeframe(
 
     output_path = (
         PROCESSED_DIR
-        / f"xauusd_{timeframe}_setups.csv"
+        / f"{symbol}_{timeframe}_setups.csv"
     )
 
-    df.to_csv(
+    # timestamp is carried as the DataFrame's index throughout
+    # the pipeline (see data_loader.load_ohlcv_csv), not as a
+    # regular column. index=False here would silently drop it --
+    # every row would still LOOK complete (a full OHLC candle,
+    # entry/stop/target, outcome) but there'd be no way to find
+    # that candle on an actual chart to sanity-check it, which is
+    # exactly the kind of "looks right in the CSV" false
+    # confidence that's easy to miss. reset_index() turns the
+    # index back into a proper named "timestamp" column before
+    # saving.
+    df.reset_index().to_csv(
         output_path,
         index=False,
     )
@@ -448,21 +510,41 @@ def process_timeframe(
 # Main
 # ---------------------------------------------------------------------
 
-def main() -> None:
-    """Run the complete research pipeline."""
+def run_symbol(symbol: str) -> None:
+    """Run the complete research pipeline for one symbol.
+
+    Fully self-contained: its own per-timeframe sections, its own
+    FINAL SUMMARY. Never mixed with another symbol's numbers -- see
+    the SYMBOLS comment above for why.
+    """
 
     print()
-    print("=" * 70)
-    print("XAUUSD SMC / ICT RESEARCH PIPELINE")
-    print("=" * 70)
+    print("#" * 70)
+    print(f"# {symbol.upper()} SMC / ICT RESEARCH PIPELINE")
+    print("#" * 70)
+
+    filenames = _raw_filenames(symbol)
 
     all_results: dict[str, pd.DataFrame] = {}
+    missing_files: list[str] = []
 
-    for timeframe, filename in TIMEFRAMES.items():
+    for timeframe, filename in filenames.items():
+
+        input_path = RAW_DIR / filename
+
+        if not input_path.exists():
+            print(
+                f"\nSkipping {symbol.upper()} {timeframe.upper()}: "
+                f"missing raw dataset {input_path} "
+                "(run src.mt5_data first)."
+            )
+            missing_files.append(timeframe)
+            continue
 
         try:
 
             all_results[timeframe] = process_timeframe(
+                symbol,
                 timeframe,
                 filename,
             )
@@ -472,10 +554,17 @@ def main() -> None:
             print()
             print(
                 f"ERROR processing "
-                f"{timeframe.upper()}: {exc}"
+                f"{symbol.upper()} {timeframe.upper()}: {exc}"
             )
 
             raise
+
+    if not all_results:
+        print(
+            f"\nNo data found for {symbol.upper()} at all -- "
+            "skipping this symbol entirely."
+        )
+        return
 
     # ---------------------------------------------------------
     # Final summary
@@ -537,7 +626,7 @@ def main() -> None:
     combined_total = total_wins + total_losses + total_timeouts
 
     print(
-        f"COMBINED (all timeframes pooled): "
+        f"COMBINED ({symbol.upper()}, all timeframes pooled): "
         f"{combined_total} labeled setups"
     )
 
@@ -580,8 +669,28 @@ def main() -> None:
         )
 
     print()
-    print("Research pipeline completed.")
-    print("No live orders were executed.")
+    print(f"{symbol.upper()} research pipeline completed.")
+
+    if missing_files:
+        print(
+            f"({symbol.upper()} timeframes skipped due to missing "
+            f"raw data: {', '.join(t.upper() for t in missing_files)})"
+        )
+
+
+def main() -> None:
+    """Run the complete research pipeline for every symbol in SYMBOLS.
+
+    Each symbol is fully independent -- see run_symbol()'s docstring.
+    """
+
+    for symbol in SYMBOLS:
+        run_symbol(symbol)
+
+    print()
+    print("=" * 70)
+    print("All symbols processed. No live orders were executed.")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

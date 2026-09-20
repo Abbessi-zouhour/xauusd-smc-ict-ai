@@ -61,6 +61,14 @@ MIN_RISK_ATR_MULTIPLE = 0.5
 ENTRY_MODE = "fvg_midpoint"
 FVG_RETRACEMENT = 0.5
 
+# Same rationale/default as run_research.py's SPREAD dict -- keep
+# these two in sync, or the sweep won't be measuring the same
+# pipeline the main research run uses.
+SPREAD = {
+    "xauusd": 0.30,
+    "xagusd": 0.03,
+}
+
 # Effectively "no filter" -- detect_setups requires minimum_rr > 0,
 # and calculate_available_rr needs *some* value to compute
 # valid_2r_setup against, but we ignore that column here and filter
@@ -75,22 +83,32 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
-TIMEFRAMES = {
-    "m15": "xauusd_m15.csv",
-    "h1": "xauusd_h1.csv",
-    "h4": "xauusd_h4.csv",
-    "d1": "xauusd_d1.csv",
-}
+# Symbols to sweep, each completely separately -- see
+# run_research.py's SYMBOLS comment for why these are never pooled
+# together. Keep in sync with src.mt5_data's SYMBOLS keys.
+SYMBOLS = ["xauusd", "xagusd"]
+
+TIMEFRAME_NAMES = ["m15", "h1", "h4", "d1"]
+
+
+def _raw_filenames(symbol: str) -> dict[str, str]:
+    return {
+        tf: f"{symbol}_{tf}.csv"
+        for tf in TIMEFRAME_NAMES
+    }
 
 
 # ---------------------------------------------------------------------
-# Pipeline, one timeframe, unfiltered
+# Pipeline, one symbol/timeframe, unfiltered
 # ---------------------------------------------------------------------
 
-def _detect_all_setups(timeframe: str, filename: str) -> pd.DataFrame:
+def _detect_all_setups(
+    symbol: str, timeframe: str, filename: str,
+) -> pd.DataFrame:
     """
     Run structure -> liquidity -> ICT -> setups -> labels for one
-    timeframe, WITHOUT discarding setups below the usual RR bar.
+    symbol/timeframe, WITHOUT discarding setups below the usual RR
+    bar.
 
     Returns every row that has a complete entry/stop/target/label,
     tagged with which timeframe it came from and its available_rr,
@@ -111,6 +129,8 @@ def _detect_all_setups(timeframe: str, filename: str) -> pd.DataFrame:
     df = detect_liquidity(df, lookback=20, tolerance=0.10)
     df = detect_ict(df)
 
+    symbol_spread = SPREAD.get(symbol, 0.0)
+
     df = detect_setups(
         df,
         sequence_window=3,
@@ -120,6 +140,7 @@ def _detect_all_setups(timeframe: str, filename: str) -> pd.DataFrame:
         min_risk_atr_multiple=MIN_RISK_ATR_MULTIPLE,
         entry_mode=ENTRY_MODE,
         fvg_retracement=FVG_RETRACEMENT,
+        spread=symbol_spread,
     )
 
     # only_valid_2r=False: label every setup with complete levels,
@@ -244,23 +265,31 @@ def _summarize_at_threshold(
 # Entry point
 # ---------------------------------------------------------------------
 
-def run_threshold_sweep() -> pd.DataFrame:
+def run_threshold_sweep_for_symbol(symbol: str) -> pd.DataFrame | None:
 
-    print("=" * 70)
-    print("RR THRESHOLD SWEEP")
-    print("=" * 70)
+    print("#" * 70)
+    print(f"# {symbol.upper()} RR THRESHOLD SWEEP")
+    print("#" * 70)
+
+    filenames = _raw_filenames(symbol)
 
     all_labeled = []
 
-    for timeframe, filename in TIMEFRAMES.items():
+    for timeframe, filename in filenames.items():
 
-        print(f"\nDetecting setups on {timeframe.upper()}...")
+        print(f"\nDetecting setups on {symbol.upper()} {timeframe.upper()}...")
 
-        try:
-            labeled = _detect_all_setups(timeframe, filename)
-        except FileNotFoundError as error:
-            print(f"  Skipping {timeframe}: {error}")
+        input_path = RAW_DIR / filename
+
+        if not input_path.exists():
+            print(
+                f"  Skipping {symbol.upper()} {timeframe.upper()}: "
+                f"missing raw dataset {input_path} "
+                "(run src.mt5_data first)."
+            )
             continue
+
+        labeled = _detect_all_setups(symbol, timeframe, filename)
 
         has_outcome = labeled["outcome"].notna()
         print(
@@ -271,9 +300,11 @@ def run_threshold_sweep() -> pd.DataFrame:
         all_labeled.append(labeled)
 
     if not all_labeled:
-        raise RuntimeError(
-            "No timeframe data found -- nothing to sweep."
+        print(
+            f"\nNo data found for {symbol.upper()} at all -- "
+            "skipping this symbol entirely."
         )
+        return None
 
     pooled = pd.concat(all_labeled, ignore_index=True)
 
@@ -281,7 +312,7 @@ def run_threshold_sweep() -> pd.DataFrame:
 
     print()
     print("=" * 70)
-    print("POOLED (all timeframes) -- THRESHOLD SWEEP")
+    print(f"{symbol.upper()} POOLED (all timeframes) -- THRESHOLD SWEEP")
     print("=" * 70)
     print(
         f"{'RR >=':>6} | {'n':>4} | {'W':>3} | {'L':>3} | "
@@ -334,7 +365,7 @@ def run_threshold_sweep() -> pd.DataFrame:
     # so you can see whether any one timeframe is driving the
     # pooled numbers.
     # ---------------------------------------------------------
-    for timeframe in TIMEFRAMES:
+    for timeframe in TIMEFRAME_NAMES:
 
         tf_labeled = labeled_pooled[
             labeled_pooled["timeframe"] == timeframe
@@ -345,7 +376,7 @@ def run_threshold_sweep() -> pd.DataFrame:
 
         print()
         print("-" * 70)
-        print(f"{timeframe.upper()} only")
+        print(f"{symbol.upper()} {timeframe.upper()} only")
         print("-" * 70)
 
         for threshold in RR_THRESHOLDS:
@@ -374,13 +405,31 @@ def run_threshold_sweep() -> pd.DataFrame:
     # without rerunning detection.
     # ---------------------------------------------------------
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = PROCESSED_DIR / "xauusd_threshold_sweep_pooled.csv"
-    pooled.to_csv(out_path, index=False)
+    out_path = PROCESSED_DIR / f"{symbol}_threshold_sweep_pooled.csv"
+    pooled.reset_index().to_csv(out_path, index=False)
 
     print()
-    print(f"Saved pooled unfiltered dataset to: {out_path}")
+    print(f"Saved {symbol.upper()} pooled unfiltered dataset to: {out_path}")
 
     return pd.DataFrame(rows)
+
+
+def run_threshold_sweep() -> dict[str, pd.DataFrame]:
+    """Run the RR threshold sweep for every symbol in SYMBOLS.
+
+    Each symbol is fully independent, its own report and its own
+    output CSV -- never pooled with another symbol.
+    """
+
+    results = {}
+
+    for symbol in SYMBOLS:
+        result = run_threshold_sweep_for_symbol(symbol)
+        if result is not None:
+            results[symbol] = result
+        print()
+
+    return results
 
 
 if __name__ == "__main__":

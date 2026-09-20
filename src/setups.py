@@ -648,6 +648,7 @@ def detect_setups(
     min_risk_atr_multiple: float | None = None,
     entry_mode: str = "close",
     fvg_retracement: float = 0.5,
+    spread: float = 0.0,
 ) -> pd.DataFrame:
     """
     Complete setup detection pipeline.
@@ -661,7 +662,7 @@ def detect_setups(
           ↓
         Structural target
           ↓
-        Actual RR
+        Actual RR (net of spread)
           ↓
         RR >= minimum_rr
 
@@ -684,6 +685,13 @@ def detect_setups(
         function's docstring -- "fvg_midpoint" requires
         label_setup_outcomes() to check for an actual fill
         before a setup counts as a trade.
+
+    spread:
+        Passed through to targets.calculate_available_rr(). See
+        that function's docstring for the mechanics. Applied
+        AFTER min_risk_atr_multiple's floor is checked against
+        the gross (pre-spread) risk, but BEFORE the minimum_rr
+        filter -- so minimum_rr is always judged net of cost.
     """
 
     if minimum_rr <= 0:
@@ -712,13 +720,14 @@ def detect_setups(
     )
 
     # ---------------------------------------------------------
-    # 3. Find Structural Target + Actual RR
+    # 3. Find Structural Target + Actual RR (net of spread)
     # ---------------------------------------------------------
     result = calculate_available_rr(
         result,
         minimum_rr=minimum_rr,
         max_target_atr_multiple=max_target_atr_multiple,
         min_risk_atr_multiple=min_risk_atr_multiple,
+        spread=spread,
     )
 
     # ---------------------------------------------------------

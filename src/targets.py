@@ -387,6 +387,7 @@ def calculate_available_rr(
     minimum_rr: float = 2.0,
     max_target_atr_multiple: float | None = None,
     min_risk_atr_multiple: float | None = None,
+    spread: float = 0.0,
 ) -> pd.DataFrame:
     """
     Calculate the actual reward-to-risk ratio.
@@ -420,11 +421,44 @@ def calculate_available_rr(
         When atr is missing or non-positive for a given row, no
         floor is applied for that row. Pass None (default) to
         reproduce the original unbounded behavior.
+
+    spread:
+        Fixed round-trip cost, in price units, applied to every
+        setup before anything else in this function (the RR
+        filter, min_risk_atr_multiple, and every downstream
+        consumer of available_risk/available_reward/available_rr
+        all see cost-adjusted numbers). We only have OHLC, not a
+        historical bid/ask series, so this approximates a
+        broker's spread as one fixed value rather than something
+        that varies with volatility or price level over the
+        dataset's history -- a real spread does neither perfectly,
+        but a fixed value in price units is a much closer
+        approximation to how CFD/forex-style spreads are usually
+        quoted than a spread that scales with price level would
+        be (see run_research.py / threshold_sweep.py's SPREAD
+        constant for the source of a reasonable default).
+
+        Mechanically: effective_risk = raw_risk + spread,
+        effective_reward = raw_reward - spread. A winning setup's
+        realized R shrinks (available_rr uses the *effective*
+        numbers). A losing setup's realized R is still exactly
+        -1.0 by construction, because R itself is now measured
+        against the cost-inclusive risk unit -- the loss isn't
+        being made artificially worse, "1R" is just being defined
+        more honestly. Setups whose reward can't even cover the
+        spread (effective_reward <= 0) are excluded entirely, same
+        as any other invalid reward. Pass 0.0 (default) to
+        reproduce the original no-cost behavior.
     """
 
     if minimum_rr <= 0:
         raise ValueError(
             "minimum_rr must be greater than 0."
+        )
+
+    if spread < 0:
+        raise ValueError(
+            "spread must be >= 0."
         )
 
     result = find_structural_targets(
@@ -519,6 +553,40 @@ def calculate_available_rr(
     ] = bearish_reward[
         bearish_valid
     ]
+
+    # -----------------------------------------------------------------
+    # Spread cost
+    #
+    # Applied here, after raw risk/reward are computed from price
+    # levels but BEFORE min_risk_atr_multiple and the RR filter --
+    # both of those, and every downstream consumer of
+    # available_risk/available_reward/available_rr, should see
+    # cost-adjusted numbers. See the spread parameter's docstring
+    # above for the mechanics and why a fixed value is used.
+    # -----------------------------------------------------------------
+
+    result["available_risk_gross"] = result["available_risk"]
+    result["available_reward_gross"] = result["available_reward"]
+
+    if spread > 0:
+
+        has_levels = result["available_risk"].notna()
+
+        result.loc[
+            has_levels,
+            "available_risk",
+        ] = (
+            result.loc[has_levels, "available_risk"]
+            + spread
+        )
+
+        result.loc[
+            has_levels,
+            "available_reward",
+        ] = (
+            result.loc[has_levels, "available_reward"]
+            - spread
+        )
 
     # -----------------------------------------------------------------
     # Validate risk and reward
@@ -632,6 +700,7 @@ def detect_targets(
     minimum_rr: float = 2.0,
     max_target_atr_multiple: float | None = None,
     min_risk_atr_multiple: float | None = None,
+    spread: float = 0.0,
 ) -> pd.DataFrame:
     """
     Complete structural-target pipeline.
@@ -646,6 +715,8 @@ def detect_targets(
           ↓
         Available Risk
           ↓
+        Spread cost
+          ↓
         Actual RR
           ↓
         Minimum RR filter
@@ -656,4 +727,5 @@ def detect_targets(
         minimum_rr=minimum_rr,
         max_target_atr_multiple=max_target_atr_multiple,
         min_risk_atr_multiple=min_risk_atr_multiple,
+        spread=spread,
     )
