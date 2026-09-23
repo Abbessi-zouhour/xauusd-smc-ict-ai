@@ -136,7 +136,7 @@ def _summarize_setups_file(symbol: str, timeframe: str) -> dict | None:
     if not path.exists():
         return None
 
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, low_memory=False)
 
     if "valid_2r_setup" not in df.columns or "outcome" not in df.columns:
         return None
