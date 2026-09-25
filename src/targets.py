@@ -73,6 +73,7 @@ def _find_previous_bullish_target(
     position: int,
     entry: float,
     max_distance: float | None = None,
+    min_reward: float | None = None,
 ) -> tuple[float, int]:
     """
     Find the nearest previous confirmed swing high above entry.
@@ -86,6 +87,16 @@ def _find_previous_bullish_target(
         implausibly distant target is unlikely to be reached
         within any reasonable holding period. Pass None (default)
         to keep the original unbounded behavior.
+
+    min_reward:
+        Optional floor, in absolute price units, on how far above
+        entry the target must be. When set, candidates that clear
+        this floor are preferred over the plain-nearest candidate;
+        if none clear it, the plain-nearest candidate is still
+        returned (the caller -- find_structural_targets -- decides
+        whether to fall back further, e.g. to an ATR-multiple
+        target). Pass None (default) to reproduce the original
+        nearest-only behavior.
 
     Returns:
         (target_price, target_position)
@@ -129,7 +140,19 @@ def _find_previous_bullish_target(
     if candidates.empty:
         return np.nan, -1
 
-    # Nearest structural level above entry.
+    # Prefer the nearest candidate that already clears min_reward;
+    # fall back to the plain-nearest candidate (original behavior)
+    # if none does.
+    if min_reward is not None:
+        sufficient = candidates[
+            candidates[price_col] - entry
+            >= min_reward
+        ]
+        if not sufficient.empty:
+            candidates = sufficient
+
+    # Nearest (of whichever candidate set survived above) structural
+    # level above entry.
     target_price = candidates[
         price_col
     ].min()
@@ -162,6 +185,7 @@ def _find_previous_bearish_target(
     position: int,
     entry: float,
     max_distance: float | None = None,
+    min_reward: float | None = None,
 ) -> tuple[float, int]:
     """
     Find the nearest previous confirmed swing low below entry.
@@ -173,6 +197,13 @@ def _find_previous_bearish_target(
         entry the target may be. See _find_previous_bullish_target
         for the rationale. Pass None (default) to keep the
         original unbounded behavior.
+
+    min_reward:
+        Optional floor, in absolute price units, on how far below
+        entry the target must be. See _find_previous_bullish_target
+        for the rationale (mirrored here for the bearish side).
+        Pass None (default) to reproduce the original nearest-only
+        behavior.
 
     Returns:
         (target_price, target_position)
@@ -215,7 +246,19 @@ def _find_previous_bearish_target(
     if candidates.empty:
         return np.nan, -1
 
-    # Nearest structural level below entry.
+    # Prefer the nearest candidate that already clears min_reward;
+    # fall back to the plain-nearest candidate (original behavior)
+    # if none does.
+    if min_reward is not None:
+        sufficient = candidates[
+            entry - candidates[price_col]
+            >= min_reward
+        ]
+        if not sufficient.empty:
+            candidates = sufficient
+
+    # Nearest (of whichever candidate set survived above) structural
+    # level below entry.
     target_price = candidates[
         price_col
     ].max()
@@ -246,15 +289,20 @@ def _find_previous_bearish_target(
 def find_structural_targets(
     df: pd.DataFrame,
     max_target_atr_multiple: float | None = None,
+    minimum_rr: float | None = None,
+    atr_fallback_multiple: float | None = None,
 ) -> pd.DataFrame:
     """
     Find a structural target for every detected setup.
 
     Bullish:
-        nearest previous confirmed swing high above entry.
+        nearest previous confirmed swing high above entry that
+        clears minimum_rr (if minimum_rr is set), else the plain
+        nearest swing high, else an ATR-multiple fallback (if
+        atr_fallback_multiple is set).
 
     Bearish:
-        nearest previous confirmed swing low below entry.
+        mirrored, using swing lows below entry.
 
     No future candles are used.
 
@@ -274,9 +322,38 @@ def find_structural_targets(
         unknown, not as "no limit"). Pass None (default) to
         reproduce the original unbounded behavior.
 
+    minimum_rr:
+        Optional. When set (and 'stop_loss' is present with
+        positive implied risk for a row), the structural search
+        prefers a swing whose distance from entry already implies
+        reward/risk >= minimum_rr over the plain-nearest swing.
+        This directly targets the failure mode where the nearest
+        confirmed swing is almost always too close to clear the
+        2R filter on its own, so the 2R-filtered sample ends up
+        dominated by whatever rare setups happen to have a distant
+        swing nearby -- see run_research.py's "too few 2R setups"
+        warning. Pass None (default) to reproduce the original
+        nearest-only behavior.
+
+    atr_fallback_multiple:
+        Optional, and only used when 'atr' is a column. If no
+        structural swing's implied reward clears minimum_rr (or no
+        structural swing exists at all), fall back to an ATR-
+        multiple target -- entry +/- max(risk * minimum_rr,
+        atr_fallback_multiple * atr) -- instead of leaving
+        structural_target as NaN or stuck with a too-close swing.
+        The fallback distance is capped by max_target_atr_multiple
+        when that is also set. Falls back only when minimum_rr is
+        also set (there is no "risk" to size the floor against
+        otherwise) and a positive risk/atr are available for that
+        row. Pass None (default) to reproduce the original
+        behavior (structural swings only, no fallback).
+
     Additional audit columns:
-        target_index
-        target_age
+        target_index    (-1 when there is no matching swing row,
+                          including every atr_fallback target)
+        target_age      (NaN when target_index is -1)
+        target_source   "structural" | "atr_fallback" | "none"
     """
 
     _validate_input(df)
@@ -286,18 +363,17 @@ def find_structural_targets(
     result["structural_target"] = np.nan
     result["target_index"] = -1
     result["target_age"] = np.nan
+    result["target_source"] = "none"
 
     has_atr = "atr" in result.columns
+    has_stop_loss = "stop_loss" in result.columns
 
     for position in range(len(result)):
 
-        direction = result.iloc[
-            position
-        ]["setup_direction"]
+        row = result.iloc[position]
 
-        entry = result.iloc[
-            position
-        ]["entry"]
+        direction = row["setup_direction"]
+        entry = row["entry"]
 
         if pd.isna(entry):
             continue
@@ -308,12 +384,34 @@ def find_structural_targets(
 
         if max_target_atr_multiple is not None and has_atr:
 
-            atr_value = result.iloc[position]["atr"]
+            atr_value = row["atr"]
 
             if pd.notna(atr_value) and atr_value > 0:
                 max_distance = (
                     max_target_atr_multiple * float(atr_value)
                 )
+
+        # -------------------------------------------------------------
+        # Risk / min_reward, needed for the "prefer a swing that
+        # already clears minimum_rr" behavior and the ATR fallback.
+        # -------------------------------------------------------------
+
+        risk = np.nan
+        min_reward = None
+
+        if minimum_rr is not None and has_stop_loss:
+
+            stop_loss = row["stop_loss"]
+
+            if pd.notna(stop_loss):
+
+                if direction == "bullish":
+                    risk = entry - float(stop_loss)
+                elif direction == "bearish":
+                    risk = float(stop_loss) - entry
+
+                if pd.notna(risk) and risk > 0:
+                    min_reward = risk * minimum_rr
 
         # -------------------------------------------------------------
         # Bullish setup
@@ -327,6 +425,7 @@ def find_structural_targets(
                     position,
                     entry,
                     max_distance=max_distance,
+                    min_reward=min_reward,
                 )
             )
 
@@ -342,11 +441,76 @@ def find_structural_targets(
                     position,
                     entry,
                     max_distance=max_distance,
+                    min_reward=min_reward,
                 )
             )
 
         else:
             continue
+
+        # -------------------------------------------------------------
+        # Did the structural search actually clear min_reward?
+        # (It may have returned the plain-nearest swing instead,
+        # if nothing cleared min_reward -- see the helper functions.)
+        # -------------------------------------------------------------
+
+        source = "none"
+        structural_ok = not pd.isna(target)
+
+        if structural_ok and min_reward is not None:
+
+            reward = (
+                target - entry
+                if direction == "bullish"
+                else entry - target
+            )
+
+            structural_ok = reward >= min_reward
+
+        if structural_ok:
+            source = "structural"
+
+        # -------------------------------------------------------------
+        # ATR fallback: only when the structural search didn't clear
+        # min_reward (or found nothing), and we have what we need to
+        # size a fallback distance.
+        # -------------------------------------------------------------
+
+        elif (
+            atr_fallback_multiple is not None
+            and has_atr
+            and min_reward is not None
+            and pd.notna(risk)
+            and risk > 0
+        ):
+
+            atr_value = row["atr"]
+
+            if pd.notna(atr_value) and atr_value > 0:
+
+                fallback_distance = (
+                    atr_fallback_multiple * float(atr_value)
+                )
+
+                fallback_distance = max(
+                    fallback_distance,
+                    min_reward,
+                )
+
+                if max_distance is not None:
+                    fallback_distance = min(
+                        fallback_distance,
+                        max_distance,
+                    )
+
+                target = (
+                    entry + fallback_distance
+                    if direction == "bullish"
+                    else entry - fallback_distance
+                )
+
+                target_position = -1
+                source = "atr_fallback"
 
         # -------------------------------------------------------------
         # Store target
@@ -371,9 +535,18 @@ def find_structural_targets(
             result.iat[
                 position,
                 result.columns.get_loc(
-                    "target_age"
+                    "target_source"
                 ),
-            ] = position - target_position
+            ] = source
+
+            if target_position != -1:
+
+                result.iat[
+                    position,
+                    result.columns.get_loc(
+                        "target_age"
+                    ),
+                ] = position - target_position
 
     return result
 
@@ -388,6 +561,7 @@ def calculate_available_rr(
     max_target_atr_multiple: float | None = None,
     min_risk_atr_multiple: float | None = None,
     spread: float = 0.0,
+    atr_fallback_multiple: float | None = None,
 ) -> pd.DataFrame:
     """
     Calculate the actual reward-to-risk ratio.
@@ -449,6 +623,14 @@ def calculate_available_rr(
         spread (effective_reward <= 0) are excluded entirely, same
         as any other invalid reward. Pass 0.0 (default) to
         reproduce the original no-cost behavior.
+
+    atr_fallback_multiple:
+        See find_structural_targets(). Passed through unchanged.
+        This is the "loosen the target definition" research
+        option: when the nearest structural swing is too close to
+        clear minimum_rr, fall back to an ATR-multiple target
+        instead of discarding the setup. Pass None (default) to
+        reproduce the original structural-swing-only behavior.
     """
 
     if minimum_rr <= 0:
@@ -464,6 +646,8 @@ def calculate_available_rr(
     result = find_structural_targets(
         df,
         max_target_atr_multiple=max_target_atr_multiple,
+        minimum_rr=minimum_rr,
+        atr_fallback_multiple=atr_fallback_multiple,
     )
 
     result["available_reward"] = np.nan
@@ -701,6 +885,7 @@ def detect_targets(
     max_target_atr_multiple: float | None = None,
     min_risk_atr_multiple: float | None = None,
     spread: float = 0.0,
+    atr_fallback_multiple: float | None = None,
 ) -> pd.DataFrame:
     """
     Complete structural-target pipeline.
@@ -709,7 +894,8 @@ def detect_targets(
 
         Setup
           ↓
-        Structural Target
+        Structural Target (structural swing, else ATR fallback
+        when atr_fallback_multiple is set)
           ↓
         Available Reward
           ↓
@@ -728,4 +914,5 @@ def detect_targets(
         max_target_atr_multiple=max_target_atr_multiple,
         min_risk_atr_multiple=min_risk_atr_multiple,
         spread=spread,
+        atr_fallback_multiple=atr_fallback_multiple,
     )

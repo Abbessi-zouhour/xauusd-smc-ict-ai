@@ -71,22 +71,26 @@ MAX_TARGET_ATR_MULTIPLE = 8.0
 MIN_RISK_ATR_MULTIPLE = 0.5
 
 # ---------------------------------------------------------------------
-# Round-trip spread cost, in price units, PER SYMBOL.
+# ATR-multiple fallback target, in multiples of ATR at the setup
+# candle.
 #
-# This pipeline only has OHLC, not a historical bid/ask series, so
-# this is a fixed approximation rather than something that varies
-# with volatility over the dataset's history. Spread must be
-# per-symbol: a fixed dollar amount is meaningful for one instrument's
-# price scale and wildly wrong for another (0.30 as a XAUUSD spread,
-# ~4378, is ~0.007% of price; the same 0.30 applied to XAGUSD, ~60-95,
-# would be 0.3-0.5% of price -- an order of magnitude too large,
-# and it visibly wiped out almost every XAGUSD setup's reward when
-# first tried). Check each symbol's own live bid/ask in MT5 Market
-# Watch and set its value here -- xagusd's 0.03 below is a rough
-# placeholder, NOT verified against a live quote the way xauusd's
-# 0.30 was; correct it once you've checked. Set a symbol's spread to
-# 0.0 to reproduce the original no-cost behavior for it.
+# The nearest confirmed structural swing beyond entry is very often
+# only just beyond entry, since swings are frequent -- so the
+# structural-target search tends to produce a small reward relative
+# to risk, and the 2R filter ends up selecting almost exclusively
+# the rare setups that happen to have a distant swing nearby (a
+# tiny, unrepresentative sample). When set, find_structural_targets()
+# still prefers a real structural swing whenever one clears minimum_rr
+# on its own; this value only kicks in as a fallback target -- sized
+# to at least this many ATRs, and at least minimum_rr * risk -- for
+# setups where no structural swing does. Capped by
+# MAX_TARGET_ATR_MULTIPLE above, same as a structural target would be.
+# Set to None to reproduce the original behavior (structural swings
+# only, no fallback -- this is what produced the very small 2R-filtered
+# samples noted in checkup.py's output).
 # ---------------------------------------------------------------------
+
+ATR_FALLBACK_MULTIPLE = 4.0
 
 SPREAD = {
     "xauusd": 0.30,
@@ -235,6 +239,7 @@ def process_timeframe(
         entry_mode="fvg_midpoint",
         fvg_retracement=0.5,
         spread=symbol_spread,
+        atr_fallback_multiple=ATR_FALLBACK_MULTIPLE,
     )
 
     # ---------------------------------------------------------
@@ -299,10 +304,7 @@ def process_timeframe(
         ).sum()
     )
 
-    total_setups = (
-        bullish_count
-        + bearish_count
-    )
+    total_setups = int(df["setup_direction"].isin(["bullish", "bearish"]).sum())
 
     valid_rr_count = int(
         df["valid_2r_setup"].sum()

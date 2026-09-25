@@ -649,6 +649,7 @@ def detect_setups(
     entry_mode: str = "close",
     fvg_retracement: float = 0.5,
     spread: float = 0.0,
+    atr_fallback_multiple: float | None = None,
 ) -> pd.DataFrame:
     """
     Complete setup detection pipeline.
@@ -692,6 +693,13 @@ def detect_setups(
         AFTER min_risk_atr_multiple's floor is checked against
         the gross (pre-spread) risk, but BEFORE the minimum_rr
         filter -- so minimum_rr is always judged net of cost.
+        
+        atr_fallback_multiple:
+        Passed through to targets.calculate_available_rr(). See
+        that function's docstring for the mechanics -- this is
+        the "loosen the target definition" option: falls back to
+        an ATR-multiple target when no structural swing clears
+        minimum_rr on its own.
     """
 
     if minimum_rr <= 0:
@@ -728,6 +736,7 @@ def detect_setups(
         max_target_atr_multiple=max_target_atr_multiple,
         min_risk_atr_multiple=min_risk_atr_multiple,
         spread=spread,
+        atr_fallback_multiple=atr_fallback_multiple,
     )
 
     # ---------------------------------------------------------

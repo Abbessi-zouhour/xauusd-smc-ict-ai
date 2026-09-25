@@ -141,8 +141,8 @@ def _summarize_setups_file(symbol: str, timeframe: str) -> dict | None:
     if "valid_2r_setup" not in df.columns or "outcome" not in df.columns:
         return None
 
-    total_setups = len(df)
-    valid_2r = int((df["valid_2r_setup"] == True).sum())  # noqa: E712
+    total_setups = int(df["setup_direction"].isin(["bullish", "bearish"]).sum())  # noqa: E712
+    valid_2r = int((df["valid_2r_setup"] == True).sum())  # noqa: E712# noqa: E712
 
     decided = df[df["outcome"].isin([1, -1])]
     n_labeled = len(decided)
